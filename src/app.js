@@ -11,7 +11,7 @@ function createApp(jobService, statusTracker) {
   });
 
   app.use("/api/jobs", createJobRoutes(jobService));
-  app.use("/api/status", createStatusRoutes(statusTracker));
+  app.use("/api/status", createStatusRoutes(statusTracker, jobService));
 
   return app;
 }

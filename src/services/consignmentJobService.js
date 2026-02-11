@@ -2,12 +2,15 @@ const { getPool } = require("../db");
 const { info, error } = require("../logger");
 const {
   ensureDescricaoColumn,
-  getPendingClients,
+  getPendingClientsBatch,
   updateClientByCpf,
 } = require("../repositories/clientRepository");
 const {
   getLatestTokensByEmpresa,
 } = require("../repositories/tokenRepository");
+
+const MAX_CONSULTAS_HORA_POR_TOKEN = 250;
+const HOUR_MS = 60 * 60 * 1000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -168,6 +171,48 @@ function shouldLogProgress(lastPercent, currentPercent, current, total) {
   return currentPercent - lastPercent >= 5;
 }
 
+function splitClientsAcrossTokens(clients, totalTokens, maxPerToken) {
+  const safeTokens = Math.max(0, Number.parseInt(totalTokens, 10) || 0);
+  const safePerToken = Math.max(0, Number.parseInt(maxPerToken, 10) || 0);
+  const batches = Array.from({ length: safeTokens }, () => []);
+
+  if (!Array.isArray(clients) || safeTokens <= 0 || safePerToken <= 0) {
+    return batches;
+  }
+
+  const totalCapacity = safeTokens * safePerToken;
+  const clientsToDistribute = clients.slice(0, totalCapacity);
+
+  for (const [index, client] of clientsToDistribute.entries()) {
+    const tokenIndex = index % safeTokens;
+    batches[tokenIndex].push(client);
+  }
+
+  return batches;
+}
+
+function buildTokenSummary(tokenPosicao, token) {
+  return {
+    ok: true,
+    message: null,
+    tokenPosicao,
+    tokenId: token.id,
+    empresa: token.empresa,
+    totalClientesSelecionados: 0,
+    totalProcessados: 0,
+    totalIgnoradosDadosInvalidos: 0,
+    totalConsultasCriadas: 0,
+    totalConsultasAtivas400: 0,
+    totalErrosAutorizar: 0,
+    totalResultadosEncontrados: 0,
+    totalResultadosSemDados: 0,
+    totalLinhasAtualizadas: 0,
+    totalErrosApi: 0,
+    totalErrosDb: 0,
+    durationMs: 0,
+  };
+}
+
 class ConsignmentJobService {
   constructor(options) {
     this.dbConfig = options.dbConfig;
@@ -175,6 +220,13 @@ class ConsignmentJobService {
     this.v8Client = options.v8Client;
     this.statusTracker = options.statusTracker || null;
     this.isRunning = false;
+    this.tokenLastWindowStartedAt = new Map();
+    this.lastRunSnapshot = {
+      updated_at: null,
+      last_cycle: null,
+      tokens: [],
+      linhas_resumo: [],
+    };
   }
 
   recordApiError(route, status, message) {
@@ -199,6 +251,211 @@ class ConsignmentJobService {
       status,
       message,
     });
+  }
+
+  getTokenRateKey(token) {
+    if (hasValue(token.empresa)) {
+      return `empresa:${String(token.empresa).trim()}`;
+    }
+    return `token:${String(token.id || "sem_id")}`;
+  }
+
+  async waitForTokenHourlyWindow(token, tokenPosicao, totalTokens) {
+    const tokenKey = this.getTokenRateKey(token);
+    const now = Date.now();
+    const lastWindowStartedAt = this.tokenLastWindowStartedAt.get(tokenKey);
+
+    if (lastWindowStartedAt && now - lastWindowStartedAt < HOUR_MS) {
+      const waitMs = HOUR_MS - (now - lastWindowStartedAt);
+      info(
+        `Token ${tokenPosicao}/${totalTokens} aguardando ${formatDurationHhMmSs(
+          waitMs
+        )} para respeitar limite de ${MAX_CONSULTAS_HORA_POR_TOKEN} consultas/h`
+      );
+      await sleep(waitMs);
+    }
+
+    this.tokenLastWindowStartedAt.set(tokenKey, Date.now());
+  }
+
+  mergeTokenSummary(summary, tokenSummary) {
+    summary.totalClientesSelecionados += tokenSummary.totalClientesSelecionados;
+    summary.totalProcessados += tokenSummary.totalProcessados;
+    summary.totalIgnoradosDadosInvalidos += tokenSummary.totalIgnoradosDadosInvalidos;
+    summary.totalConsultasCriadas += tokenSummary.totalConsultasCriadas;
+    summary.totalConsultasAtivas400 += tokenSummary.totalConsultasAtivas400;
+    summary.totalErrosAutorizar += tokenSummary.totalErrosAutorizar;
+    summary.totalResultadosEncontrados += tokenSummary.totalResultadosEncontrados;
+    summary.totalResultadosSemDados += tokenSummary.totalResultadosSemDados;
+    summary.totalLinhasAtualizadas += tokenSummary.totalLinhasAtualizadas;
+    summary.totalErrosApi += tokenSummary.totalErrosApi;
+    summary.totalErrosDb += tokenSummary.totalErrosDb;
+  }
+
+  buildTokenFinalLine(tokenSummary, totalTokens) {
+    const tokenErrors =
+      tokenSummary.totalErrosApi +
+      tokenSummary.totalErrosAutorizar +
+      tokenSummary.totalErrosDb;
+    return `Finalizado Token ${tokenSummary.tokenPosicao}/${totalTokens} / Clientes ${
+      tokenSummary.totalClientesSelecionados
+    } (status 200=${tokenSummary.totalConsultasCriadas}, status 400=${
+      tokenSummary.totalConsultasAtivas400
+    }, erros=${tokenErrors}) | 100% | Tempo total ${formatDurationHhMmSs(
+      tokenSummary.durationMs
+    )}`;
+  }
+
+  buildLastRunSnapshot(summary) {
+    if (!summary) {
+      return null;
+    }
+
+    const totalTokens = Number(summary.totalTokensDisponiveis) || 0;
+    const totalErros =
+      (summary.totalErrosApi || 0) +
+      (summary.totalErrosAutorizar || 0) +
+      (summary.totalErrosDb || 0);
+
+    const tokens = (summary.tokensExecutados || []).map((tokenSummary) => {
+      const tokenErrors =
+        tokenSummary.totalErrosApi +
+        tokenSummary.totalErrosAutorizar +
+        tokenSummary.totalErrosDb;
+      return {
+        token_posicao: tokenSummary.tokenPosicao,
+        token_total: totalTokens,
+        token_id: tokenSummary.tokenId,
+        empresa: tokenSummary.empresa || null,
+        clientes: tokenSummary.totalClientesSelecionados,
+        status_200_consultados: tokenSummary.totalConsultasCriadas,
+        status_400_aguardando_resposta_v8: tokenSummary.totalConsultasAtivas400,
+        erros: tokenErrors,
+        percent: 100,
+        tempo_total_hhmmss: formatDurationHhMmSs(tokenSummary.durationMs),
+        resumo: this.buildTokenFinalLine(tokenSummary, totalTokens),
+      };
+    });
+
+    return {
+      updated_at: new Date().toISOString(),
+      last_cycle: {
+        ok: !!summary.ok,
+        source: summary.source || null,
+        started_at: summary.startedAt || null,
+        finished_at: summary.finishedAt || null,
+        duration_ms: summary.durationMs || 0,
+        duration_hhmmss: formatDurationHhMmSs(summary.durationMs || 0),
+        tokens_total: totalTokens,
+        tokens_processados: summary.totalTokensProcessados || 0,
+        clientes_total: summary.totalClientesSelecionados || 0,
+        status_200_consultados: summary.totalConsultasCriadas || 0,
+        status_400_aguardando_resposta_v8: summary.totalConsultasAtivas400 || 0,
+        erros: totalErros,
+        message: summary.message || null,
+      },
+      tokens,
+      linhas_resumo: tokens.map((item) => item.resumo),
+    };
+  }
+
+  getStatusSnapshot() {
+    return this.lastRunSnapshot || {
+      updated_at: null,
+      last_cycle: null,
+      tokens: [],
+      linhas_resumo: [],
+    };
+  }
+
+  async processTokenBatch({ pool, token, tokenIndex, totalTokens, clients }) {
+    const tokenStartedAt = Date.now();
+    const tokenPosicao = tokenIndex + 1;
+    const tokenSummary = buildTokenSummary(tokenPosicao, token);
+    const safeClients = Array.isArray(clients) ? clients : [];
+
+    info(`Token ${tokenPosicao}/${totalTokens}`);
+    if (this.statusTracker) {
+      this.statusTracker.incrementWindow();
+    }
+
+    try {
+      await this.waitForTokenHourlyWindow(token, tokenPosicao, totalTokens);
+      tokenSummary.totalClientesSelecionados = safeClients.length;
+      info(
+        `Token ${tokenPosicao}/${totalTokens} | Clientes separados ${safeClients.length}`
+      );
+
+      const totalClientes = safeClients.length;
+      const progressStartedAt = Date.now();
+      let lastLoggedPercent = -1;
+      const logCompactProgress = (current) => {
+        const percent = progressPercent(current, totalClientes);
+        if (!shouldLogProgress(lastLoggedPercent, percent, current, totalClientes)) {
+          return;
+        }
+        lastLoggedPercent = percent;
+        const eta = estimateEtaText(current, totalClientes, progressStartedAt);
+        info(
+          `Token ${tokenPosicao}/${totalTokens} | Cliente ${current}/${totalClientes} - ${percent}% ${compactProgressText(
+            current,
+            totalClientes
+          )} | ETA ${eta}`
+        );
+      };
+      logCompactProgress(0);
+
+      for (const [index, client] of safeClients.entries()) {
+        const posicao = index + 1;
+
+        if (!hasValidClientData(client)) {
+          tokenSummary.totalIgnoradosDadosInvalidos += 1;
+          logCompactProgress(posicao);
+          continue;
+        }
+
+        const itemSummary = await this.processClient(pool, token.access_token, client);
+        tokenSummary.totalProcessados += 1;
+        tokenSummary.totalConsultasCriadas += itemSummary.consultasCriadas;
+        tokenSummary.totalConsultasAtivas400 += itemSummary.consultasAtivas400;
+        tokenSummary.totalErrosAutorizar += itemSummary.errosAutorizar;
+        tokenSummary.totalResultadosEncontrados += itemSummary.resultadosEncontrados;
+        tokenSummary.totalResultadosSemDados += itemSummary.resultadosSemDados;
+        tokenSummary.totalLinhasAtualizadas += itemSummary.linhasAtualizadas;
+        tokenSummary.totalErrosApi += itemSummary.errosApi;
+        tokenSummary.totalErrosDb += itemSummary.errosDb;
+        logCompactProgress(posicao);
+
+        if (this.jobConfig.waitBetweenClientsMs > 0) {
+          await sleep(this.jobConfig.waitBetweenClientsMs);
+        }
+      }
+    } catch (err) {
+      tokenSummary.ok = false;
+      tokenSummary.message = err.message;
+      tokenSummary.totalErrosDb += 1;
+      this.recordDbError("job:token_batch", 500, err.message);
+      error(
+        `Falha durante processamento do token ${tokenPosicao}/${totalTokens}: ${err.message}`
+      );
+    }
+
+    tokenSummary.durationMs = Date.now() - tokenStartedAt;
+    const tokenErrors =
+      tokenSummary.totalErrosApi +
+      tokenSummary.totalErrosAutorizar +
+      tokenSummary.totalErrosDb;
+    info(
+      `Finalizado Token ${tokenPosicao}/${totalTokens} / Clientes ${
+        tokenSummary.totalClientesSelecionados
+      } (status 200=${tokenSummary.totalConsultasCriadas}, status 400=${
+        tokenSummary.totalConsultasAtivas400
+      }, erros=${tokenErrors}) | 100% | Tempo total ${formatDurationHhMmSs(
+        tokenSummary.durationMs
+      )}`
+    );
+
+    return tokenSummary;
   }
 
   async run(source = "manual") {
@@ -265,123 +522,66 @@ class ConsignmentJobService {
       if (!latestTokens || latestTokens.length === 0) {
         summary.ok = false;
         summary.message = "Nenhum token encontrado na tabela tokens_v8.";
-        return this.finishSummary(summary, startedAt);
+        const finished = this.finishSummary(summary, startedAt);
+        this.lastRunSnapshot = this.buildLastRunSnapshot(finished);
+        return finished;
       }
       summary.totalTokensDisponiveis = latestTokens.length;
       info(`${latestTokens.length} Tokens encontrados`);
 
       const totalTokens = latestTokens.length;
+      const maxPerToken = Math.min(
+        MAX_CONSULTAS_HORA_POR_TOKEN,
+        Math.max(
+          1,
+          Number.parseInt(this.jobConfig.maxClientsPerToken, 10) ||
+            MAX_CONSULTAS_HORA_POR_TOKEN
+        )
+      );
+      const totalClientsLimit = totalTokens * maxPerToken;
 
-      for (const [tokenIndex, token] of latestTokens.entries()) {
-        const tokenStartedAt = Date.now();
-        const tokenPosicao = tokenIndex + 1;
-        const tokenSummary = {
-          tokenPosicao,
-          tokenId: token.id,
-          empresa: token.empresa,
-          totalClientesSelecionados: 0,
-          totalProcessados: 0,
-          totalIgnoradosDadosInvalidos: 0,
-          totalConsultasCriadas: 0,
-          totalConsultasAtivas400: 0,
-          totalErrosAutorizar: 0,
-          totalResultadosEncontrados: 0,
-          totalResultadosSemDados: 0,
-          totalLinhasAtualizadas: 0,
-          totalErrosApi: 0,
-          totalErrosDb: 0,
-        };
-        info(`Token ${tokenPosicao}/${totalTokens}`);
-        if (this.statusTracker) {
-          this.statusTracker.incrementWindow();
-        }
+      let cycleClients;
+      try {
+        cycleClients = await getPendingClientsBatch(pool, totalClientsLimit);
+      } catch (err) {
+        summary.totalErrosDb += 1;
+        this.recordDbError("sql:get_pending_clients_batch", 500, err.message);
+        throw err;
+      }
 
-        let clients;
-        try {
-          clients = await getPendingClients(pool);
-        } catch (err) {
-          summary.totalErrosDb += 1;
-          tokenSummary.totalErrosDb += 1;
-          this.recordDbError("sql:get_pending_clients", 500, err.message);
-          throw err;
-        }
+      info(
+        `Clientes separados ${cycleClients.length} (sem repeticao) para ${totalTokens} tokens, max ${maxPerToken} por token`
+      );
 
-        tokenSummary.totalClientesSelecionados = clients.length;
-        summary.totalClientesSelecionados += clients.length;
-        info(`Clientes separados ${clients.length}`);
+      const clientsByToken = splitClientsAcrossTokens(
+        cycleClients,
+        totalTokens,
+        maxPerToken
+      );
+      const tokenSummaries = await Promise.all(
+        latestTokens.map((token, tokenIndex) =>
+          this.processTokenBatch({
+            pool,
+            token,
+            tokenIndex,
+            totalTokens,
+            clients: clientsByToken[tokenIndex] || [],
+          })
+        )
+      );
 
-        const totalClientes = clients.length;
-        const progressStartedAt = Date.now();
-        let lastLoggedPercent = -1;
-        const logCompactProgress = (current) => {
-          const percent = progressPercent(current, totalClientes);
-          if (!shouldLogProgress(lastLoggedPercent, percent, current, totalClientes)) {
-            return;
-          }
-          lastLoggedPercent = percent;
-          const eta = estimateEtaText(current, totalClientes, progressStartedAt);
-          info(
-            `Token ${tokenPosicao}/${totalTokens} | Cliente ${current}/${totalClientes} - ${percent}% ${compactProgressText(
-              current,
-              totalClientes
-            )} | ETA ${eta}`
-          );
-        };
-        logCompactProgress(0);
-
-        for (const [index, client] of clients.entries()) {
-          const posicao = index + 1;
-
-          if (!hasValidClientData(client)) {
-            summary.totalIgnoradosDadosInvalidos += 1;
-            tokenSummary.totalIgnoradosDadosInvalidos += 1;
-            logCompactProgress(posicao);
-            continue;
-          }
-
-          const itemSummary = await this.processClient(pool, token.access_token, client);
-          summary.totalProcessados += 1;
-          summary.totalConsultasCriadas += itemSummary.consultasCriadas;
-          summary.totalConsultasAtivas400 += itemSummary.consultasAtivas400;
-          summary.totalErrosAutorizar += itemSummary.errosAutorizar;
-          summary.totalResultadosEncontrados += itemSummary.resultadosEncontrados;
-          summary.totalResultadosSemDados += itemSummary.resultadosSemDados;
-          summary.totalLinhasAtualizadas += itemSummary.linhasAtualizadas;
-          summary.totalErrosApi += itemSummary.errosApi;
-          summary.totalErrosDb += itemSummary.errosDb;
-
-          tokenSummary.totalProcessados += 1;
-          tokenSummary.totalConsultasCriadas += itemSummary.consultasCriadas;
-          tokenSummary.totalConsultasAtivas400 += itemSummary.consultasAtivas400;
-          tokenSummary.totalErrosAutorizar += itemSummary.errosAutorizar;
-          tokenSummary.totalResultadosEncontrados += itemSummary.resultadosEncontrados;
-          tokenSummary.totalResultadosSemDados += itemSummary.resultadosSemDados;
-          tokenSummary.totalLinhasAtualizadas += itemSummary.linhasAtualizadas;
-          tokenSummary.totalErrosApi += itemSummary.errosApi;
-          tokenSummary.totalErrosDb += itemSummary.errosDb;
-          logCompactProgress(posicao);
-
-          if (this.jobConfig.waitBetweenClientsMs > 0) {
-            await sleep(this.jobConfig.waitBetweenClientsMs);
-          }
-        }
-
+      for (const tokenSummary of tokenSummaries) {
         summary.totalTokensProcessados += 1;
         summary.tokensExecutados.push(tokenSummary);
-        const tokenDurationMs = Date.now() - tokenStartedAt;
-        const tokenErrors =
-          tokenSummary.totalErrosApi +
-          tokenSummary.totalErrosAutorizar +
-          tokenSummary.totalErrosDb;
-        info(
-          `Finalizado Token ${tokenPosicao}/${totalTokens} / Clientes ${
-            tokenSummary.totalClientesSelecionados
-          } (status 200=${tokenSummary.totalConsultasCriadas}, status 400=${
-            tokenSummary.totalConsultasAtivas400
-          }, erros=${tokenErrors}) | 100% | Tempo total ${formatDurationHhMmSs(
-            tokenDurationMs
-          )}`
-        );
+        this.mergeTokenSummary(summary, tokenSummary);
+      }
+
+      const failedTokens = tokenSummaries.filter((tokenSummary) => !tokenSummary.ok);
+      if (failedTokens.length > 0) {
+        summary.ok = false;
+        summary.message = `Falha em ${failedTokens.length} token(s): ${failedTokens
+          .map((tokenSummary) => tokenSummary.tokenPosicao)
+          .join(", ")}`;
       }
 
       const finished = this.finishSummary(summary, startedAt);
@@ -395,6 +595,7 @@ class ConsignmentJobService {
         )}`
       );
       info("Finalizado, proximo fluxo comeca em 1 hora");
+      this.lastRunSnapshot = this.buildLastRunSnapshot(finished);
       return finished;
     } catch (err) {
       summary.ok = false;
@@ -410,6 +611,7 @@ class ConsignmentJobService {
           finished.durationMs
         )}`
       );
+      this.lastRunSnapshot = this.buildLastRunSnapshot(finished);
       return finished;
     } finally {
       if (cycleStarted && this.statusTracker) {

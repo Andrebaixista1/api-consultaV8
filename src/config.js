@@ -56,6 +56,7 @@ const config = {
       3000
     ),
     waitBetweenClientsMs: toInt(process.env.WAIT_BETWEEN_CLIENTS_MS, 0),
+    maxClientsPerToken: toInt(process.env.MAX_CLIENTS_PER_TOKEN, 250),
     schedulerEnabled: toBool(process.env.SCHEDULER_ENABLED, true),
     schedulerCron: process.env.SCHEDULER_CRON || "0 * * * *",
     runOnStartup: toBool(process.env.JOB_RUN_ON_STARTUP, true),

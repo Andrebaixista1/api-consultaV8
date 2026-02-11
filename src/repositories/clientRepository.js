@@ -28,6 +28,60 @@ ORDER BY status_consulta_v8 DESC, NEWID();
   return result.recordset || [];
 }
 
+async function getPendingClientsBatch(pool, limit) {
+  const safeLimit = Math.max(0, Number.parseInt(limit, 10) || 0);
+  if (safeLimit <= 0) {
+    return [];
+  }
+
+  const query = `
+USE apis_v8;
+
+;WITH pending AS (
+  SELECT
+    *,
+    RIGHT(
+      REPLICATE('0', 11) +
+      REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(ISNULL(cliente_cpf, ''))), '.', ''), '-', ''), '/', ''), ' ', ''), CHAR(9), ''),
+      11
+    ) AS cpf11,
+    ROW_NUMBER() OVER (
+      PARTITION BY RIGHT(
+        REPLICATE('0', 11) +
+        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(ISNULL(cliente_cpf, ''))), '.', ''), '-', ''), '/', ''), ' ', ''), CHAR(9), ''),
+        11
+      )
+      ORDER BY
+        CASE status_consulta_v8
+          WHEN 'Consentimento Aprovado' THEN 3
+          WHEN 'Aguardando Consulta' THEN 2
+          WHEN 'Aguardando' THEN 1
+          ELSE 0
+        END DESC,
+        NEWID()
+    ) AS cpf_rownum
+  FROM dbo.clientes_clt
+  WHERE status_consulta_v8 IN ('Aguardando', 'Aguardando Consulta', 'Consentimento Aprovado')
+)
+SELECT TOP (@limit) *
+FROM pending
+WHERE cpf_rownum = 1
+ORDER BY
+  CASE status_consulta_v8
+    WHEN 'Consentimento Aprovado' THEN 3
+    WHEN 'Aguardando Consulta' THEN 2
+    WHEN 'Aguardando' THEN 1
+    ELSE 0
+  END DESC,
+  NEWID();
+`;
+
+  const request = pool.request();
+  request.input("limit", sql.Int, safeLimit);
+  const result = await request.query(query);
+  return result.recordset || [];
+}
+
 async function updateClientByCpf(pool, payload) {
   const query = `
 USE apis_v8;
@@ -61,5 +115,6 @@ SELECT @@ROWCOUNT AS rows_affected;
 module.exports = {
   ensureDescricaoColumn,
   getPendingClients,
+  getPendingClientsBatch,
   updateClientByCpf,
 };
