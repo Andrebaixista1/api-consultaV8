@@ -144,7 +144,7 @@ function shouldLogProgress(lastPercent, currentPercent, current, total) {
   if (lastPercent < 0) {
     return true;
   }
-  return currentPercent - lastPercent >= 10;
+  return currentPercent - lastPercent >= 5;
 }
 
 class ConsignmentJobService {
