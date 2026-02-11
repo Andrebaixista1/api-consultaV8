@@ -20,7 +20,7 @@ Os logs mostram progresso visual:
   - `7 Tokens encontrados`
   - `Token 1/7`
   - `Clientes separados 250`
-  - `Token 1/7 | Cliente 0/250 - 0% [----------------------] 0/250 (0%)`
+  - `Token 1/7 | Cliente 0/250 - 0% [----------------------] 0/250 (0%) | ETA --:--:--`
   - `...`
   - `Finalizado Token 1/7 / Clientes 250 (status 200=120, status 400=90, erros=40) | 100% | Tempo total 00:30:00`
   - `Finalizado, proximo fluxo comeca em 1 hora`

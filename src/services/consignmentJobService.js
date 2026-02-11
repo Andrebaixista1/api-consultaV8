@@ -134,6 +134,27 @@ function compactProgressText(current, total, width = 22) {
   return buildProgressBar(current, total, width);
 }
 
+function estimateEtaText(current, total, startedAtMs) {
+  if (total <= 0) {
+    return "00:00:00";
+  }
+
+  const safeCurrent = Math.min(Math.max(current, 0), total);
+  if (safeCurrent <= 0) {
+    return "--:--:--";
+  }
+
+  const elapsedMs = Math.max(0, Date.now() - startedAtMs);
+  const remaining = total - safeCurrent;
+  if (remaining <= 0) {
+    return "00:00:00";
+  }
+
+  const avgMsPerClient = elapsedMs / safeCurrent;
+  const remainingMs = Math.max(0, Math.round(avgMsPerClient * remaining));
+  return formatDurationHhMmSs(remainingMs);
+}
+
 function shouldLogProgress(lastPercent, currentPercent, current, total) {
   if (total <= 0) {
     return current === 0;
@@ -290,6 +311,7 @@ class ConsignmentJobService {
         info(`Clientes separados ${clients.length}`);
 
         const totalClientes = clients.length;
+        const progressStartedAt = Date.now();
         let lastLoggedPercent = -1;
         const logCompactProgress = (current) => {
           const percent = progressPercent(current, totalClientes);
@@ -297,11 +319,12 @@ class ConsignmentJobService {
             return;
           }
           lastLoggedPercent = percent;
+          const eta = estimateEtaText(current, totalClientes, progressStartedAt);
           info(
             `Token ${tokenPosicao}/${totalTokens} | Cliente ${current}/${totalClientes} - ${percent}% ${compactProgressText(
               current,
               totalClientes
-            )}`
+            )} | ETA ${eta}`
           );
         };
         logCompactProgress(0);
