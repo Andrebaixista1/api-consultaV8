@@ -5,14 +5,15 @@ USE apis_v8;
 ;WITH x AS (
   SELECT
       t.*,
-      ROW_NUMBER() OVER (PARTITION BY t.empresa ORDER BY t.created_at DESC, t.id DESC) AS rn
+      ROW_NUMBER() OVER (PARTITION BY t.empresa ORDER BY t.updated_at DESC, t.id DESC) AS rn
   FROM dbo.tokens_v8 t
+  WHERE LTRIM(RTRIM(COALESCE(t.origem_api, ''))) = 'V8 Digital'
 )
 SELECT
     id,
     access_token,
     expires_in,
-    created_at,
+    updated_at,
     empresa
 FROM x
 WHERE rn = 1

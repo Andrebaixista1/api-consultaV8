@@ -2,6 +2,7 @@ const { getPool } = require("../db");
 const { info, error } = require("../logger");
 const {
   ensureDescricaoColumn,
+  ensureTokenUsadoColumn,
   getPendingClientsBatch,
   updateClientByCpf,
 } = require("../repositories/clientRepository");
@@ -82,6 +83,7 @@ function mapStatus(status) {
   const upper = String(status).toUpperCase();
   const map = {
     CONSENT_APPROVED: "Consentimento Aprovado",
+    WAITING_CONSENT: "Aguardando Consentimento",
     WAITING_CONSULT: "Aguardando Consulta",
     WAITING_CREDIT_ANALYSIS: "Aguardando Analise Credito",
     FAILED: "Falha",
@@ -414,7 +416,12 @@ class ConsignmentJobService {
           continue;
         }
 
-        const itemSummary = await this.processClient(pool, token.access_token, client);
+        const itemSummary = await this.processClient(
+          pool,
+          token.access_token,
+          client,
+          token.empresa
+        );
         tokenSummary.totalProcessados += 1;
         tokenSummary.totalConsultasCriadas += itemSummary.consultasCriadas;
         tokenSummary.totalConsultasAtivas400 += itemSummary.consultasAtivas400;
@@ -504,9 +511,10 @@ class ConsignmentJobService {
 
       try {
         await ensureDescricaoColumn(pool);
+        await ensureTokenUsadoColumn(pool);
       } catch (err) {
         summary.totalErrosDb += 1;
-        this.recordDbError("sql:ensure_descricao", 500, err.message);
+        this.recordDbError("sql:ensure_columns", 500, err.message);
         throw err;
       }
 
@@ -632,7 +640,7 @@ class ConsignmentJobService {
     return result;
   }
 
-  async processClient(pool, accessToken, client) {
+  async processClient(pool, accessToken, client, tokenEmpresa) {
     const result = {
       consultasCriadas: 0,
       consultasAtivas400: 0,
@@ -650,6 +658,7 @@ class ConsignmentJobService {
       clientId: client.id,
       cpf: String(client.cliente_cpf || ""),
       nome: String(client.cliente_nome || ""),
+      tokenEmpresa: hasValue(tokenEmpresa) ? String(tokenEmpresa).trim() : null,
     };
 
     let shouldGetResult = false;
@@ -764,7 +773,7 @@ class ConsignmentJobService {
         return this.finalizeClientResult(result, context, false, "api3_sem_dados");
       }
 
-      const payload = this.extractPayloadForUpdate(apiData);
+      const payload = this.extractPayloadForUpdate(apiData, tokenEmpresa);
       if (!payload) {
         result.resultadosSemDados += 1;
         return this.finalizeClientResult(result, context, false, "payload_invalido");
@@ -806,7 +815,7 @@ class ConsignmentJobService {
     }
   }
 
-  extractPayloadForUpdate(apiData) {
+  extractPayloadForUpdate(apiData, tokenEmpresa) {
     const first = apiData?.[0] || {};
     const second = apiData?.[1] || {};
     const documentNumber = first.documentNumber ?? second.documentNumber;
@@ -834,6 +843,7 @@ class ConsignmentJobService {
       valorLiberado: parseMarginValue(availableMarginValue),
       statusConsulta: mapStatus(status),
       descricao: cleanDescription(description),
+      tokenUsado: hasValue(tokenEmpresa) ? String(tokenEmpresa).trim() : null,
     };
   }
 }

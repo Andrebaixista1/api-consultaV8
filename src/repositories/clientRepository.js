@@ -14,6 +14,20 @@ END;
   await pool.request().query(query);
 }
 
+async function ensureTokenUsadoColumn(pool) {
+  const query = `
+USE apis_v8;
+
+IF COL_LENGTH('dbo.clientes_clt', 'token_usado') IS NULL
+BEGIN
+  ALTER TABLE dbo.clientes_clt
+  ADD token_usado NVARCHAR(255) NULL;
+END;
+`;
+
+  await pool.request().query(query);
+}
+
 async function getPendingClients(pool) {
   const query = `
 USE apis_v8;
@@ -91,7 +105,8 @@ SET
   valor_liberado = COALESCE(@valor_liberado, valor_liberado),
   created_at = SYSDATETIME(),
   status_consulta_v8 = COALESCE(@status_consulta_v8, status_consulta_v8),
-  descricao = @descricao
+  descricao = @descricao,
+  token_usado = COALESCE(@token_usado, token_usado)
 WHERE
   RIGHT(
     REPLICATE('0', 11) +
@@ -107,6 +122,7 @@ SELECT @@ROWCOUNT AS rows_affected;
   request.input("valor_liberado", sql.Decimal(18, 2), payload.valorLiberado);
   request.input("status_consulta_v8", sql.NVarChar(60), payload.statusConsulta);
   request.input("descricao", sql.NVarChar(4000), payload.descricao);
+  request.input("token_usado", sql.NVarChar(255), payload.tokenUsado);
 
   const result = await request.query(query);
   return result.recordset?.[0]?.rows_affected || 0;
@@ -114,6 +130,7 @@ SELECT @@ROWCOUNT AS rows_affected;
 
 module.exports = {
   ensureDescricaoColumn,
+  ensureTokenUsadoColumn,
   getPendingClients,
   getPendingClientsBatch,
   updateClientByCpf,
