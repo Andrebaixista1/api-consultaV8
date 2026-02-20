@@ -4,6 +4,8 @@ const express = require("express");
 const dotenv = require("dotenv");
 const axios = require("axios");
 const sql = require("mssql");
+const fs = require("fs");
+const path = require("path");
 
 dotenv.config();
 
@@ -173,6 +175,85 @@ function safeStringify(value) {
   }
 }
 
+function extractApiErrorMessage(payload) {
+  if (payload === undefined || payload === null) {
+    return "";
+  }
+
+  if (typeof payload === "string") {
+    return payload.trim();
+  }
+
+  const directKeys = [
+    "detail",
+    "description",
+    "message",
+    "error_description",
+    "title",
+    "error",
+  ];
+  for (const key of directKeys) {
+    const value = payload?.[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  if (Array.isArray(payload?.errors) && payload.errors.length > 0) {
+    const first = payload.errors[0];
+    if (typeof first === "string" && first.trim()) {
+      return first.trim();
+    }
+    if (first && typeof first === "object") {
+      for (const key of directKeys) {
+        const value = first[key];
+        if (typeof value === "string" && value.trim()) {
+          return value.trim();
+        }
+      }
+    }
+  }
+
+  if (payload?.data && typeof payload.data === "object") {
+    for (const key of directKeys) {
+      const value = payload.data[key];
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+  }
+
+  const serialized = safeStringify(payload);
+  if (serialized && serialized !== "{}" && serialized !== "[]") {
+    return serialized.slice(0, 2000);
+  }
+
+  return "";
+}
+
+function isConsultAlreadyExistsError(payload) {
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+
+  const type = String(payload.type || "").trim().toLowerCase();
+  if (type === "consult_already_exists_by_user_and_document_number") {
+    return true;
+  }
+
+  const text = [
+    payload.title,
+    payload.detail,
+    payload.message,
+    payload.error_description,
+  ]
+    .filter(Boolean)
+    .map((value) => String(value).toLowerCase())
+    .join(" ");
+
+  return text.includes("ja existe uma consulta ativa");
+}
+
 function compactMessage(payload, fallbackMessage) {
   let text = safeStringify(payload);
   if (!text || text === "undefined") {
@@ -189,21 +270,42 @@ function statusToDbValue(rawStatus) {
   if (!status) {
     return "Pendente";
   }
-  if (status.toUpperCase() === "SUCCESS") {
-    return "Sucesso";
+  const normalized = normalizeStatusToken(status);
+  const translatedMap = {
+    WAITING_CONSENT: "Aguardando Consentimento",
+    CONSENT_APPROVED: "Consentimento Aprovado",
+    WAITING_CONSULT: "Aguardando Consulta",
+    WAITING_CREDIT_ANALYSIS: "Aguardando Analise de Credito",
+    SUCCESS: "Sucesso",
+    FAILED: "Falha",
+    REJECTED: "Rejeitado",
+  };
+  if (translatedMap[normalized]) {
+    return translatedMap[normalized];
   }
   return normalizeStatusForDb(status, "Pendente");
 }
 
 const NO_RETRY_FINAL_STATUS_SET = new Set([
   "WAITING_CONSENT",
-  "CONSENT_APPROVED",
   "SUCCESS",
   "SUCESSO",
   "FAILED",
   "FALHA",
   "REJECTED",
   "REJEITADO",
+  "AGUARDANDO CONSENTIMENTO",
+  "SUCESSO",
+  "REJEITADO",
+]);
+
+const RESULT_ONLY_RETRY_STATUS_SET = new Set([
+  "CONSENT_APPROVED",
+  "WAITING_CONSULT",
+  "WAITING_CREDIT_ANALYSIS",
+  "CONSENTIMENTO APROVADO",
+  "AGUARDANDO CONSULTA",
+  "AGUARDANDO ANALISE DE CREDITO",
 ]);
 
 function normalizeStatusToken(value) {
@@ -212,6 +314,10 @@ function normalizeStatusToken(value) {
 
 function isNoRetryFinalStatus(value) {
   return NO_RETRY_FINAL_STATUS_SET.has(normalizeStatusToken(value));
+}
+
+function isResultOnlyRetryStatus(value) {
+  return RESULT_ONLY_RETRY_STATUS_SET.has(normalizeStatusToken(value));
 }
 
 function descriptionToMessage(descriptionValue, fallbackMessage = null) {
@@ -301,6 +407,9 @@ const config = {
     retryCooldownMs: toInt(process.env.V8_RETRY_COOLDOWN_MS, 45000),
     maxAttempts: toInt(process.env.V8_SUCCESS_MAX_ATTEMPTS, 5),
     tokenCacheMs: toInt(process.env.V8_TOKEN_CACHE_MS, 60000),
+    resultOnlyRetryLogPath:
+      process.env.V8_RESULT_ONLY_RETRY_LOG_PATH ||
+      path.join(__dirname, "tmp", "result_only_retry.log"),
   },
 };
 
@@ -359,15 +468,9 @@ function buildHeaders(accessToken) {
   };
 }
 
-function isDateOlderThanMs(value, ageMs) {
-  if (!value) {
-    return true;
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return true;
-  }
-  return Date.now() - date.getTime() > ageMs;
+function toSafeInt(value, fallback = 0) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 async function requestV8AccessToken(username, password) {
@@ -489,6 +592,7 @@ const state = {
   queueRegular: [],
   queuedIds: new Set(),
   retryById: new Map(),
+  resultOnlyById: new Map(),
   processing: null,
   tokenCursor: 0,
   tokenCache: {
@@ -537,6 +641,7 @@ function enqueueClient(client) {
     cliente_nome: client.cliente_nome,
     email: client.email,
     telefone: client.telefone,
+    created_at: client.created_at,
     id_token_usado: client.id_token_usado,
     token_usado: client.token_usado,
     empresa: client.empresa,
@@ -602,6 +707,39 @@ BEGIN
     ALTER TABLE dbo.clientes_v8
     ALTER COLUMN mensagem VARCHAR(MAX) NULL;
   END
+END
+
+IF NOT EXISTS (
+  SELECT 1
+  FROM sys.sequences
+  WHERE name = 'seq_clientes_v8_id'
+    AND schema_id = SCHEMA_ID('dbo')
+)
+BEGIN
+  DECLARE @startId BIGINT;
+  SELECT @startId = ISNULL(MAX(id), 0) + 1
+  FROM dbo.clientes_v8;
+
+  DECLARE @sqlSeq NVARCHAR(MAX) =
+    N'CREATE SEQUENCE dbo.seq_clientes_v8_id AS BIGINT START WITH '
+    + CAST(@startId AS NVARCHAR(30))
+    + N' INCREMENT BY 1;';
+  EXEC sp_executesql @sqlSeq;
+END
+
+IF NOT EXISTS (
+  SELECT 1
+  FROM sys.default_constraints dc
+  JOIN sys.columns c
+    ON c.object_id = dc.parent_object_id
+   AND c.column_id = dc.parent_column_id
+  WHERE dc.parent_object_id = OBJECT_ID('dbo.clientes_v8')
+    AND c.name = 'id'
+)
+BEGIN
+  ALTER TABLE dbo.clientes_v8
+  ADD CONSTRAINT DF_clientes_v8_id
+  DEFAULT (NEXT VALUE FOR dbo.seq_clientes_v8_id) FOR id;
 END
 `;
 
@@ -678,7 +816,8 @@ SELECT TOP (1)
   restante,
   token,
   created_at,
-  updated_at
+  updated_at,
+  DATEDIFF(SECOND, created_at, GETDATE()) AS age_seconds
 FROM dbo.consult_day
 WHERE id = @id;
 `;
@@ -756,18 +895,37 @@ async function resolveConsultDayTokenForClient(client) {
   }
 
   const currentToken = String(entry.token || "").trim();
+  const ageSeconds = Math.max(0, toSafeInt(entry.age_seconds, 0));
+  const total = toSafeInt(entry.total, config.consultDay.defaultTotal);
+  const usado = Math.max(0, toSafeInt(entry.usado, 0));
+  const refreshAfterSeconds = Math.max(
+    60,
+    Math.floor(config.consultDay.refreshAfterMs / 1000)
+  );
   const mustRefresh =
     !currentToken ||
-    isDateOlderThanMs(entry.created_at, config.consultDay.refreshAfterMs);
+    ageSeconds >= refreshAfterSeconds;
 
   if (!mustRefresh) {
+    if (total > 0 && usado >= total) {
+      const waitSeconds = Math.max(1, refreshAfterSeconds - ageSeconds);
+      return {
+        id: parsedId,
+        blocked: true,
+        waitMs: waitSeconds * 1000,
+        total,
+        usado,
+        restante: Math.max(0, total - usado),
+      };
+    }
+
     return {
       id: parsedId,
       accessToken: currentToken,
       refreshed: false,
-      total: entry.total,
-      usado: entry.usado,
-      restante: entry.restante,
+      total,
+      usado,
+      restante: Math.max(0, total - usado),
     };
   }
 
@@ -855,6 +1013,7 @@ SELECT TOP (@limit)
   cliente_nome,
   email,
   telefone,
+  created_at,
   id_token_usado,
   token_usado,
   empresa,
@@ -863,7 +1022,7 @@ SELECT TOP (@limit)
 FROM dbo.clientes_v8 WITH (READPAST)
 WHERE UPPER(ISNULL(LTRIM(RTRIM(status_consulta_v8)), '')) NOT IN (
   'WAITING_CONSENT',
-  'CONSENT_APPROVED',
+  'AGUARDANDO CONSENTIMENTO',
   'SUCCESS',
   'SUCESSO',
   'FAILED',
@@ -925,10 +1084,10 @@ SELECT @@ROWCOUNT AS rows_affected;
   return result.recordset?.[0]?.rows_affected || 0;
 }
 
-async function incrementConsultDayById(idTokenUsado) {
+async function consumeConsultDayQuotaById(idTokenUsado) {
   const parsedId = Number.parseInt(idTokenUsado, 10);
   if (!Number.isFinite(parsedId) || parsedId <= 0) {
-    return { updated: false, reason: "invalid_id_token_usado" };
+    return { consumed: false, reason: "invalid_id_token_usado" };
   }
 
   const pool = await getPool();
@@ -945,23 +1104,62 @@ SET
     ELSE total - (COALESCE(usado, 0) + 1)
   END,
   updated_at = GETDATE()
-OUTPUT inserted.total, inserted.usado, inserted.restante, inserted.updated_at
-WHERE id = @id;
+OUTPUT inserted.id, inserted.total, inserted.usado, inserted.restante, inserted.created_at, inserted.updated_at
+WHERE id = @id
+  AND (total IS NULL OR COALESCE(usado, 0) < total);
 `;
 
   const result = await request.query(query);
   const row = result.recordset?.[0];
-  if (!row) {
-    return { updated: false, reason: "consult_day_not_found", id: parsedId };
+  if (row) {
+    return {
+      consumed: true,
+      id: row.id,
+      total: row.total,
+      usado: row.usado,
+      restante: row.restante,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
   }
 
+  const statusReq = pool.request();
+  statusReq.input("id", sql.Int, parsedId);
+  const statusQuery = `
+SELECT TOP (1)
+  id,
+  total,
+  usado,
+  restante,
+  created_at,
+  updated_at,
+  DATEDIFF(SECOND, created_at, GETDATE()) AS age_seconds
+FROM dbo.consult_day
+WHERE id = @id;
+`;
+  const statusResult = await statusReq.query(statusQuery);
+  const current = statusResult.recordset?.[0];
+  if (!current) {
+    return { consumed: false, reason: "consult_day_not_found", id: parsedId };
+  }
+
+  const total = toSafeInt(current.total, config.consultDay.defaultTotal);
+  const usado = Math.max(0, toSafeInt(current.usado, 0));
+  const refreshAfterSeconds = Math.max(
+    60,
+    Math.floor(config.consultDay.refreshAfterMs / 1000)
+  );
+  const ageSeconds = Math.max(0, toSafeInt(current.age_seconds, 0));
+  const waitSeconds = Math.max(1, refreshAfterSeconds - ageSeconds);
+
   return {
-    updated: true,
+    consumed: false,
+    reason: "quota_exceeded",
     id: parsedId,
-    total: row.total,
-    usado: row.usado,
-    restante: row.restante,
-    updated_at: row.updated_at,
+    total,
+    usado,
+    restante: Math.max(0, total - usado),
+    waitMs: waitSeconds * 1000,
   };
 }
 
@@ -989,18 +1187,7 @@ async function duplicateClientRows(sourceId, rows) {
     );
 
     const query = `
-DECLARE @new_id BIGINT = CAST(
-  DATEDIFF_BIG(MILLISECOND, '2000-01-01', SYSUTCDATETIME()) * 1000
-  + ABS(CHECKSUM(NEWID())) % 1000
-AS BIGINT);
-
-WHILE EXISTS (SELECT 1 FROM dbo.clientes_v8 WHERE id = @new_id)
-BEGIN
-  SET @new_id = @new_id + 1;
-END
-
 INSERT INTO dbo.clientes_v8 (
-  id,
   cliente_cpf,
   cliente_sexo,
   nascimento,
@@ -1019,7 +1206,6 @@ INSERT INTO dbo.clientes_v8 (
   id_token_usado
 )
 SELECT
-  @new_id,
   cliente_cpf,
   cliente_sexo,
   nascimento,
@@ -1049,15 +1235,18 @@ SELECT @@ROWCOUNT AS rows_affected;
   return inserted;
 }
 
-async function deleteDuplicateCpfRows(cpf, keepId) {
+async function deleteDuplicateSameConsultRows(cpf, nome, createdAt, keepId) {
   const normalizedCpf = normalizeCpf(cpf);
-  if (!normalizedCpf) {
+  const normalizedNome = String(nome || "").trim();
+  if (!normalizedCpf || !normalizedNome || !createdAt) {
     return 0;
   }
 
   const pool = await getPool();
   const request = pool.request();
   request.input("cpf", sql.VarChar(11), normalizedCpf);
+  request.input("nome", sql.VarChar(255), normalizedNome);
+  request.input("created_at", sql.DateTime2, new Date(createdAt));
   request.input("keep_id", sql.BigInt, keepId);
 
   const query = `
@@ -1065,15 +1254,27 @@ async function deleteDuplicateCpfRows(cpf, keepId) {
   SELECT
     id,
     ROW_NUMBER() OVER (
-      PARTITION BY cliente_cpf
+      PARTITION BY
+        RIGHT(
+          REPLICATE('0', 11) +
+          REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(ISNULL(cliente_cpf, ''))), '.', ''), '-', ''), '/', ''), ' ', ''), CHAR(9), ''),
+          11
+        ),
+        LTRIM(RTRIM(ISNULL(cliente_nome, ''))),
+        created_at
       ORDER BY
         CASE WHEN id = @keep_id THEN 0 ELSE 1 END,
         updated_at DESC,
-        created_at DESC,
         id DESC
     ) AS rn
   FROM dbo.clientes_v8
-  WHERE cliente_cpf = @cpf
+  WHERE RIGHT(
+      REPLICATE('0', 11) +
+      REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(ISNULL(cliente_cpf, ''))), '.', ''), '-', ''), '/', ''), ' ', ''), CHAR(9), ''),
+      11
+    ) = @cpf
+    AND LTRIM(RTRIM(ISNULL(cliente_nome, ''))) = @nome
+    AND created_at = @created_at
 )
 DELETE FROM dbo.clientes_v8
 WHERE id IN (
@@ -1087,6 +1288,22 @@ SELECT @@ROWCOUNT AS rows_affected;
 
   const result = await request.query(query);
   return Number(result.recordset?.[0]?.rows_affected || 0);
+}
+
+function pushResultOnlyRetryTempLog(entry) {
+  try {
+    const logPath = config.worker.resultOnlyRetryLogPath;
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(
+      logPath,
+      `${JSON.stringify({ ...entry, logged_at: nowIso() })}\n`,
+      "utf8"
+    );
+  } catch (err) {
+    error("Falha ao registrar log temporario de retry", {
+      erro: err?.message || String(err),
+    });
+  }
 }
 
 async function processClient(client) {
@@ -1104,7 +1321,12 @@ async function processClient(client) {
   let lastParsedPayload = null;
   let marginValue = null;
   let success = false;
+  let attemptsExecuted = 0;
   let stopAttemptsWithoutRetry = false;
+  let runOnlyLastApi = state.resultOnlyById.has(client.id);
+  let shouldParkForResultOnly = false;
+  let consultDayLimitWaitMs = null;
+  let lastConsultDayQuota = null;
   let consultDayToken = null;
   let tokens = [];
 
@@ -1117,6 +1339,14 @@ async function processClient(client) {
         consult_day_id: client.id_token_usado,
         erro: tokenErr?.message || String(tokenErr),
       });
+    }
+    if (consultDayToken?.blocked) {
+      consultDayLimitWaitMs = Math.max(
+        1000,
+        toSafeInt(consultDayToken.waitMs, config.consultDay.refreshAfterMs)
+      );
+      stopAttemptsWithoutRetry = true;
+      lastErrorMessage = "Limite de consultas/hora atingido para token consult_day";
     }
     try {
       tokens = await loadTokens();
@@ -1131,7 +1361,12 @@ async function processClient(client) {
     }
 
     for (let attempt = 1; attempt <= config.worker.maxAttempts; attempt += 1) {
+      if (stopAttemptsWithoutRetry) {
+        break;
+      }
+      attemptsExecuted = attempt;
       state.counters.totalAttempts += 1;
+      let retryThisCycle = false;
 
       const token =
         consultDayToken && consultDayToken.accessToken
@@ -1144,35 +1379,97 @@ async function processClient(client) {
       const accessToken = String(token.access_token || "").trim();
 
       try {
-        const createResp = await createConsult(accessToken, client);
-        const createStatus = Number(createResp.status || 0);
-        const createData = createResp.data || {};
-        const consultId = createData.id || createData.consultId || null;
+        if (!runOnlyLastApi) {
+          const createResp = await createConsult(accessToken, client);
+          const createStatus = Number(createResp.status || 0);
+          const createData = createResp.data || {};
+          const consultId = createData.id || createData.consultId || null;
+          const isAlreadyActiveConsult =
+            createStatus === 400 && isConsultAlreadyExistsError(createData);
 
-        if (consultId) {
-          await sleep(config.worker.waitBetweenApisMs);
+          // Conta no consult_day somente quando a consulta parte do zero.
+          // No fluxo "somente GET final" (consulta ja ativa), nao consome cota.
+          if (consultDayToken?.id && !isAlreadyActiveConsult) {
+            const quota = await consumeConsultDayQuotaById(consultDayToken.id);
+            if (!quota.consumed) {
+              if (quota.reason === "quota_exceeded") {
+                consultDayLimitWaitMs = Math.max(
+                  1000,
+                  toSafeInt(quota.waitMs, config.consultDay.refreshAfterMs)
+                );
+                lastErrorMessage =
+                  "Limite de 250 consultas por hora atingido; aguardando nova janela";
+                shouldParkForResultOnly = true;
+                stopAttemptsWithoutRetry = true;
+                break;
+              }
+              throw new Error(`Falha ao consumir cota consult_day: ${quota.reason}`);
+            }
+            lastConsultDayQuota = quota;
+          }
+
+          if (consultId) {
+            await sleep(config.worker.waitBetweenApisMs);
           const authResp = await authorizeConsult(accessToken, consultId);
           if (Number(authResp.status || 0) >= 400) {
             lastApiStatus = normalizeStatusForDb(`HTTP_${authResp.status}`, lastApiStatus || "Pendente");
+            const authMessage = extractApiErrorMessage(authResp.data);
+            if (authMessage) {
+              lastErrorMessage = authMessage;
+            }
             lastResponsePayload = {
               step: "authorize",
               status: authResp.status,
               data: authResp.data,
             };
           }
+        } else if (isAlreadyActiveConsult) {
+          runOnlyLastApi = true;
+          shouldParkForResultOnly = true;
+          lastApiStatus = normalizeStatusForDb(
+            "WAITING_CONSULT",
+            lastApiStatus || "Pendente"
+          );
+          const createMessage = extractApiErrorMessage(createData);
+          if (createMessage) {
+            lastErrorMessage = createMessage;
+          }
+          lastResponsePayload = {
+            step: "consult_create_already_exists",
+            status: createStatus,
+            data: createData,
+          };
+          info("Consulta ja ativa na V8; seguindo somente com API final", {
+            id: client.id,
+            cpf: client.cliente_cpf,
+            tipoConsulta: client.tipoConsulta || "",
+          });
         } else if (createStatus >= 400) {
           lastApiStatus = normalizeStatusForDb(`HTTP_${createStatus}`, lastApiStatus || "Pendente");
+          const createMessage = extractApiErrorMessage(createResp.data);
+          if (createMessage) {
+            lastErrorMessage = createMessage;
+          }
           lastResponsePayload = {
             step: "consult_create",
             status: createStatus,
             data: createResp.data,
           };
+          }
         }
 
         await sleep(config.worker.waitBetweenApisMs);
         const resultResp = await getConsultResult(accessToken, client.cliente_cpf);
         const resultPayload = resultResp.data || {};
         lastResponsePayload = resultPayload;
+        const resultStatus = Number(resultResp.status || 0);
+        if (resultStatus >= 400) {
+          lastApiStatus = normalizeStatusForDb(`HTTP_${resultStatus}`, lastApiStatus || "Pendente");
+          const resultMessage = extractApiErrorMessage(resultPayload);
+          if (resultMessage) {
+            lastErrorMessage = resultMessage;
+          }
+        }
 
         const parsed = parseConsultPayload(resultPayload);
         lastParsedPayload = parsed;
@@ -1186,18 +1483,54 @@ async function processClient(client) {
         if (parsed.hasSuccess) {
           success = true;
           stopAttemptsWithoutRetry = true;
+          state.resultOnlyById.delete(client.id);
           break;
         }
 
-        if (isNoRetryFinalStatus(parsed.statusText)) {
+        if (runOnlyLastApi && parsed.totalRows === 0) {
+          lastApiStatus = normalizeStatusForDb(
+            "WAITING_CONSULT",
+            lastApiStatus || "WAITING_CONSULT"
+          );
+          if (!lastErrorMessage) {
+            lastErrorMessage =
+              "Consulta ativa identificada; aguardando retorno da API final";
+          }
+          if (attempt < config.worker.maxAttempts) {
+            retryThisCycle = true;
+          } else {
+            shouldParkForResultOnly = true;
+            stopAttemptsWithoutRetry = true;
+          }
+        } else if (isResultOnlyRetryStatus(parsed.statusText)) {
+          runOnlyLastApi = true;
+          state.resultOnlyById.set(client.id, {
+            status: normalizeStatusToken(parsed.statusText),
+            updatedAt: Date.now(),
+          });
+          lastErrorMessage =
+            parsed.descriptionText ||
+            parsed.statusText ||
+            `Status intermediario na tentativa ${attempt}`;
+          if (attempt < config.worker.maxAttempts) {
+            retryThisCycle = true;
+          } else {
+            shouldParkForResultOnly = true;
+            stopAttemptsWithoutRetry = true;
+          }
+        } else if (isNoRetryFinalStatus(parsed.statusText)) {
           stopAttemptsWithoutRetry = true;
-          break;
+          state.resultOnlyById.delete(client.id);
+        } else {
+          stopAttemptsWithoutRetry = true;
         }
 
-        lastErrorMessage =
-          parsed.descriptionText ||
-          parsed.statusText ||
-          `Sem SUCCESS na tentativa ${attempt}`;
+        if (!lastErrorMessage) {
+          lastErrorMessage =
+            parsed.descriptionText ||
+            parsed.statusText ||
+            `Sem SUCCESS apos ${attempt} tentativa(s)`;
+        }
       } catch (err) {
         lastErrorMessage = err?.message || String(err);
         lastResponsePayload = {
@@ -1205,14 +1538,21 @@ async function processClient(client) {
           attempt,
           message: lastErrorMessage,
         };
+        if (runOnlyLastApi && attempt < config.worker.maxAttempts) {
+          retryThisCycle = true;
+        } else {
+          stopAttemptsWithoutRetry = true;
+        }
       }
 
       if (stopAttemptsWithoutRetry) {
         break;
       }
 
-      if (attempt < config.worker.maxAttempts) {
+      if (retryThisCycle && attempt < config.worker.maxAttempts) {
         await sleep(config.worker.retryBetweenAttemptsMs);
+      } else {
+        break;
       }
     }
 
@@ -1243,25 +1583,30 @@ async function processClient(client) {
         mensagem: primaryMessage,
       });
       const duplicatedCount = await duplicateClientRows(client.id, duplicateRows);
-      const removedDuplicates = await deleteDuplicateCpfRows(client.cliente_cpf, client.id);
-      const consultDayUpdate = await incrementConsultDayById(client.id_token_usado);
+      const removedDuplicates = await deleteDuplicateSameConsultRows(
+        client.cliente_cpf,
+        client.cliente_nome,
+        client.created_at,
+        client.id
+      );
       state.counters.successClients += 1;
       state.retryById.delete(client.id);
+      state.resultOnlyById.delete(client.id);
 
       info("Cliente concluido com SUCCESS", {
         id: client.id,
         cpf: client.cliente_cpf,
         tipoConsulta: client.tipoConsulta || "",
-        consult_day_id: consultDayUpdate.id,
-        consult_day_updated: consultDayUpdate.updated,
-        consult_day_usado: consultDayUpdate.usado,
-        consult_day_restante: consultDayUpdate.restante,
+        consult_day_id: lastConsultDayQuota?.id,
+        consult_day_usado: lastConsultDayQuota?.usado,
+        consult_day_restante: lastConsultDayQuota?.restante,
+        tentativas_executadas: attemptsExecuted,
         duplicados: duplicatedCount,
         duplicados_removidos_cpf: removedDuplicates,
       });
     } else {
       const finalStatus = statusToDbValue(
-        primaryRow?.statusRaw || lastApiStatus || (lastErrorMessage ? "FAILED" : "Pendente")
+        primaryRow?.statusRaw || lastApiStatus || "Pendente"
       );
       await updateClient(client.id, {
         statusConsulta: finalStatus,
@@ -1269,30 +1614,90 @@ async function processClient(client) {
         mensagem: primaryMessage,
       });
       const duplicatedCount = await duplicateClientRows(client.id, duplicateRows);
-      const removedDuplicates = await deleteDuplicateCpfRows(client.cliente_cpf, client.id);
-      if (isNoRetryFinalStatus(finalStatus)) {
+      const removedDuplicates = await deleteDuplicateSameConsultRows(
+        client.cliente_cpf,
+        client.cliente_nome,
+        client.created_at,
+        client.id
+      );
+      if (isResultOnlyRetryStatus(finalStatus)) {
+        const delayMs =
+          consultDayLimitWaitMs || config.worker.retryCooldownMs;
+        state.counters.deferredClients += 1;
+        state.retryById.set(client.id, {
+          nextRetryAt: Date.now() + delayMs,
+        });
+        state.resultOnlyById.set(client.id, {
+          status: normalizeStatusToken(finalStatus),
+          updatedAt: Date.now(),
+        });
+        if (shouldParkForResultOnly) {
+          pushResultOnlyRetryTempLog({
+            id: client.id,
+            cpf: client.cliente_cpf,
+            status: finalStatus,
+            mensagem: primaryMessage,
+            modo: "ultima_api",
+          });
+        }
+        info("Cliente movido para fila temporaria da ultima API", {
+          id: client.id,
+          cpf: client.cliente_cpf,
+          tipoConsulta: client.tipoConsulta || "",
+          status_final: finalStatus,
+          tentativas_executadas: attemptsExecuted,
+          duplicados: duplicatedCount,
+          duplicados_removidos_cpf: removedDuplicates,
+          result_only: true,
+          retry_em_ms: delayMs,
+        });
+      } else if (isNoRetryFinalStatus(finalStatus)) {
         state.retryById.delete(client.id);
+        state.resultOnlyById.delete(client.id);
         info("Cliente finalizado sem retry (status final)", {
           id: client.id,
           cpf: client.cliente_cpf,
           tipoConsulta: client.tipoConsulta || "",
           status_final: finalStatus,
+          tentativas_executadas: attemptsExecuted,
           duplicados: duplicatedCount,
           duplicados_removidos_cpf: removedDuplicates,
         });
       } else {
+        const delayMs =
+          consultDayLimitWaitMs || config.worker.retryCooldownMs;
         state.counters.deferredClients += 1;
         state.retryById.set(client.id, {
-          nextRetryAt: Date.now() + config.worker.retryCooldownMs,
+          nextRetryAt: Date.now() + delayMs,
         });
+        if (runOnlyLastApi || shouldParkForResultOnly) {
+          state.resultOnlyById.set(client.id, {
+            status: normalizeStatusToken(lastApiStatus || finalStatus),
+            updatedAt: Date.now(),
+          });
+          if (shouldParkForResultOnly) {
+            pushResultOnlyRetryTempLog({
+              id: client.id,
+              cpf: client.cliente_cpf,
+              status: finalStatus,
+              mensagem: primaryMessage,
+              modo: "ultima_api_quota",
+            });
+          }
+        } else {
+          state.resultOnlyById.delete(client.id);
+        }
 
-        info("Cliente sem SUCCESS apos 5 tentativas; retornado para fila", {
+        info("Cliente sem SUCCESS; retornado para fila", {
           id: client.id,
           cpf: client.cliente_cpf,
           tipoConsulta: client.tipoConsulta || "",
           status_final: finalStatus,
+          tentativas_executadas: attemptsExecuted,
           duplicados: duplicatedCount,
           duplicados_removidos_cpf: removedDuplicates,
+          retry_em_ms: delayMs,
+          result_only: runOnlyLastApi || shouldParkForResultOnly,
         });
       }
     }
@@ -1313,7 +1718,7 @@ async function processClient(client) {
     });
 
     try {
-      const fallbackStatus = normalizeStatusForDb(lastApiStatus, "Falha");
+      const fallbackStatus = statusToDbValue(lastApiStatus || "FAILED");
       await updateClient(client.id, {
         statusConsulta: fallbackStatus,
         valorLiberado: null,
@@ -1326,12 +1731,40 @@ async function processClient(client) {
       });
     }
 
-    if (isNoRetryFinalStatus(lastApiStatus)) {
-      state.retryById.delete(client.id);
-    } else {
+    if (isResultOnlyRetryStatus(lastApiStatus)) {
+      const delayMs =
+        consultDayLimitWaitMs || config.worker.retryCooldownMs;
       state.retryById.set(client.id, {
-        nextRetryAt: Date.now() + config.worker.retryCooldownMs,
+        nextRetryAt: Date.now() + delayMs,
       });
+      state.resultOnlyById.set(client.id, {
+        status: normalizeStatusToken(lastApiStatus),
+        updatedAt: Date.now(),
+      });
+      pushResultOnlyRetryTempLog({
+        id: client.id,
+        cpf: client.cliente_cpf,
+        status: statusToDbValue(lastApiStatus),
+        mensagem: message,
+        modo: "ultima_api_erro",
+      });
+    } else if (isNoRetryFinalStatus(lastApiStatus)) {
+      state.retryById.delete(client.id);
+      state.resultOnlyById.delete(client.id);
+    } else {
+      const delayMs =
+        consultDayLimitWaitMs || config.worker.retryCooldownMs;
+      state.retryById.set(client.id, {
+        nextRetryAt: Date.now() + delayMs,
+      });
+      if (runOnlyLastApi || shouldParkForResultOnly) {
+        state.resultOnlyById.set(client.id, {
+          status: normalizeStatusToken(lastApiStatus || "PENDENTE"),
+          updatedAt: Date.now(),
+        });
+      } else {
+        state.resultOnlyById.delete(client.id);
+      }
     }
   } finally {
     state.processing = null;
@@ -1381,6 +1814,10 @@ function countPendingRetries() {
   return pending;
 }
 
+function countResultOnlyTracked() {
+  return state.resultOnlyById.size;
+}
+
 function buildStatus() {
   return {
     ok: true,
@@ -1392,6 +1829,7 @@ function buildStatus() {
       individual: state.queueIndividual.length,
       outros: state.queueRegular.length,
       retries_em_espera: countPendingRetries(),
+      ultima_api_em_espera: countResultOnlyTracked(),
     },
     processing: state.processing,
     counters: state.counters,
