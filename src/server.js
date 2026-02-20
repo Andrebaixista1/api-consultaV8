@@ -67,6 +67,102 @@ function normalizeCpf(value) {
   return digits.padStart(11, "0");
 }
 
+function normalizeCsvHeader(value) {
+  return String(value || "")
+    .replace(/^\uFEFF/, "")
+    .trim()
+    .toLowerCase();
+}
+
+function splitSemicolonCsvLine(line) {
+  const values = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (ch === ";" && !inQuotes) {
+      values.push(current);
+      current = "";
+      continue;
+    }
+
+    current += ch;
+  }
+
+  values.push(current);
+  return values.map((value) => String(value || "").replace(/^\uFEFF/, "").trim());
+}
+
+function parseCsvRowsForClientesV8(csvRaw) {
+  const text = String(csvRaw || "").replace(/\r/g, "");
+  const allLines = text
+    .split("\n")
+    .map((line) => String(line || ""))
+    .filter((line) => line.trim() !== "");
+
+  if (allLines.length < 2) {
+    throw new Error("CSV invalido: precisa de cabecalho e ao menos 1 linha.");
+  }
+
+  const headers = splitSemicolonCsvLine(allLines[0]).map(normalizeCsvHeader);
+  const idxCpf = headers.indexOf("cpf");
+  const idxNome = headers.indexOf("nome");
+  const idxTelefone = headers.indexOf("telefone");
+  const idxEmail = headers.indexOf("email");
+
+  if (idxCpf < 0 || idxNome < 0) {
+    throw new Error("CSV invalido: colunas obrigatorias cpf e nome.");
+  }
+
+  const rows = [];
+  const skipped = [];
+
+  for (let lineIndex = 1; lineIndex < allLines.length; lineIndex += 1) {
+    const line = allLines[lineIndex];
+    const cols = splitSemicolonCsvLine(line);
+
+    const cpf = normalizeCpf(cols[idxCpf]);
+    const nome = String(cols[idxNome] || "").trim();
+    const telefone =
+      idxTelefone >= 0 ? String(cols[idxTelefone] || "").trim() || null : null;
+    const emailFromCsv =
+      idxEmail >= 0 ? String(cols[idxEmail] || "").trim().toLowerCase() : "";
+    const email = emailFromCsv || `${cpf || "semcpf"}@sememail.local`;
+
+    if (!cpf || !nome) {
+      skipped.push({
+        line: lineIndex + 1,
+        motivo: "cpf_ou_nome_invalido",
+      });
+      continue;
+    }
+
+    rows.push({
+      cpf,
+      nome,
+      telefone,
+      email,
+    });
+  }
+
+  return {
+    rows,
+    skipped,
+    totalDataRows: allLines.length - 1,
+  };
+}
+
 function toBirthDate(value) {
   if (!value) {
     return "";
@@ -231,6 +327,22 @@ function extractApiErrorMessage(payload) {
   return "";
 }
 
+function buildFriendlyV8HttpError(statusCode, payload) {
+  const status = Number(statusCode || 0);
+  const detail = extractApiErrorMessage(payload);
+
+  if (status === 422) {
+    const base = "Revisar dados no portal V8";
+    const suffix = detail ? ` Detalhe retornado: ${detail}.` : "";
+    return {
+      statusDb: base,
+      message: `Nao foi possivel concluir a consulta na V8. Consulte os dados no site https://app.v8sistema.com/ e tente novamente.${suffix}`,
+    };
+  }
+
+  return null;
+}
+
 function isConsultAlreadyExistsError(payload) {
   if (!payload || typeof payload !== "object") {
     return false;
@@ -294,6 +406,8 @@ const NO_RETRY_FINAL_STATUS_SET = new Set([
   "FALHA",
   "REJECTED",
   "REJEITADO",
+  "REVISAR DADOS NO PORTAL V8",
+  "ERRO AO CONSULTAR NA V8",
   "AGUARDANDO CONSENTIMENTO",
   "SUCESSO",
   "REJEITADO",
@@ -361,6 +475,10 @@ const config = {
     host: process.env.HOST || "0.0.0.0",
     port: toInt(process.env.PORT, 3002),
   },
+  cors: {
+    origins: process.env.CORS_ORIGINS || "*",
+    allowCredentials: toBool(process.env.CORS_ALLOW_CREDENTIALS, false),
+  },
   db: {
     host: process.env.DB_HOST || "177.153.62.236",
     port: toInt(process.env.DB_PORT, 1433),
@@ -412,6 +530,53 @@ const config = {
       path.join(__dirname, "tmp", "result_only_retry.log"),
   },
 };
+
+function parseCorsOrigins(raw) {
+  const list = String(raw || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item !== "");
+  return list.length > 0 ? list : ["*"];
+}
+
+const corsAllowedOrigins = parseCorsOrigins(config.cors.origins);
+
+function isCorsOriginAllowed(origin) {
+  if (!origin) {
+    return true;
+  }
+  return (
+    corsAllowedOrigins.includes("*") ||
+    corsAllowedOrigins.includes(origin)
+  );
+}
+
+function applyCors(req, res) {
+  const origin = String(req.headers.origin || "").trim();
+
+  if (config.cors.allowCredentials) {
+    if (origin && isCorsOriginAllowed(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    }
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  } else if (origin && isCorsOriginAllowed(origin) && !corsAllowedOrigins.includes("*")) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With"
+  );
+  res.setHeader("Access-Control-Max-Age", "86400");
+}
 
 if (!config.db.password) {
   throw new Error("DB_PASSWORD nao configurada");
@@ -706,6 +871,22 @@ BEGIN
   BEGIN
     ALTER TABLE dbo.clientes_v8
     ALTER COLUMN mensagem VARCHAR(MAX) NULL;
+  END
+END
+
+IF COL_LENGTH('dbo.clientes_v8', 'token_usado') IS NOT NULL
+BEGIN
+  DECLARE @tokenLen INT;
+  SELECT @tokenLen = CHARACTER_MAXIMUM_LENGTH
+  FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_SCHEMA = 'dbo'
+    AND TABLE_NAME = 'clientes_v8'
+    AND COLUMN_NAME = 'token_usado';
+
+  IF @tokenLen IS NOT NULL AND @tokenLen <> -1
+  BEGIN
+    ALTER TABLE dbo.clientes_v8
+    ALTER COLUMN token_usado VARCHAR(MAX) NULL;
   END
 END
 
@@ -1028,7 +1209,9 @@ WHERE UPPER(ISNULL(LTRIM(RTRIM(status_consulta_v8)), '')) NOT IN (
   'FAILED',
   'FALHA',
   'REJECTED',
-  'REJEITADO'
+  'REJEITADO',
+  'REVISAR DADOS NO PORTAL V8',
+  'ERRO AO CONSULTAR NA V8'
 )
 ORDER BY
   CASE WHEN ISNULL(tipoConsulta, '') = 'Individual' THEN 0 ELSE 1 END,
@@ -1082,6 +1265,87 @@ SELECT @@ROWCOUNT AS rows_affected;
 
   const result = await request.query(query);
   return result.recordset?.[0]?.rows_affected || 0;
+}
+
+async function insertClientesV8FromCsv(rows, options) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return 0;
+  }
+
+  const pool = await getPool();
+  const transaction = new sql.Transaction(pool);
+  const insertedAt = options.insertedAt instanceof Date ? options.insertedAt : new Date();
+  const birthDate = new Date("1996-05-15T00:00:00.000Z");
+  let inserted = 0;
+
+  await transaction.begin();
+  try {
+    for (const row of rows) {
+      const request = new sql.Request(transaction);
+      request.input("cliente_cpf", sql.VarChar(20), row.cpf);
+      request.input("cliente_nome", sql.NVarChar(255), row.nome);
+      request.input("email", sql.NVarChar(255), row.email);
+      request.input("telefone", sql.VarChar(40), row.telefone);
+      request.input("tipoConsulta", sql.VarChar(255), options.tipoConsulta);
+      request.input("empresa", sql.VarChar(150), options.empresa);
+      request.input("created_at", sql.DateTime2, insertedAt);
+      request.input("updated_at", sql.DateTime2, insertedAt);
+      request.input("token_usado", sql.VarChar(sql.MAX), options.tokenUsado);
+      request.input("id_token_usado", sql.Int, options.idTokenUsado);
+      request.input("id_user", sql.BigInt, options.idUser);
+      request.input("cliente_sexo", sql.VarChar(20), "male");
+      request.input("nascimento", sql.Date, birthDate);
+      request.input("status", sql.VarChar(50), "Pendente");
+
+      const query = `
+INSERT INTO dbo.clientes_v8 (
+  cliente_cpf,
+  cliente_sexo,
+  nascimento,
+  cliente_nome,
+  email,
+  telefone,
+  created_at,
+  status_consulta_v8,
+  token_usado,
+  id_user,
+  empresa,
+  tipoConsulta,
+  updated_at,
+  id_token_usado
+)
+VALUES (
+  @cliente_cpf,
+  @cliente_sexo,
+  @nascimento,
+  @cliente_nome,
+  @email,
+  @telefone,
+  @created_at,
+  @status,
+  @token_usado,
+  @id_user,
+  @empresa,
+  @tipoConsulta,
+  @updated_at,
+  @id_token_usado
+);
+`;
+
+      await request.query(query);
+      inserted += 1;
+    }
+
+    await transaction.commit();
+    return inserted;
+  } catch (err) {
+    try {
+      await transaction.rollback();
+    } catch (_rollbackErr) {
+      // noop
+    }
+    throw err;
+  }
 }
 
 async function consumeConsultDayQuotaById(idTokenUsado) {
@@ -1163,15 +1427,36 @@ WHERE id = @id;
   };
 }
 
-async function duplicateClientRows(sourceId, rows) {
+function buildParsedRowSignature(row) {
+  const status = statusToDbValue(row?.statusRaw || row?.statusDb || "FAILED");
+  const message = descriptionToMessage(row?.description, null) || "";
+  const margin =
+    row?.marginValue === null || row?.marginValue === undefined
+      ? ""
+      : String(Number(row.marginValue).toFixed(2));
+  return `${normalizeStatusToken(status)}|${margin}|${message.trim()}`;
+}
+
+async function duplicateClientRows(sourceId, rows, primaryRow = null) {
   if (!Array.isArray(rows) || rows.length === 0) {
     return 0;
   }
 
   const pool = await getPool();
   let inserted = 0;
+  const seen = new Set();
+
+  if (primaryRow) {
+    seen.add(buildParsedRowSignature(primaryRow));
+  }
 
   for (const row of rows) {
+    const signature = buildParsedRowSignature(row);
+    if (seen.has(signature)) {
+      continue;
+    }
+    seen.add(signature);
+
     const request = pool.request();
     request.input("source_id", sql.BigInt, sourceId);
     request.input(
@@ -1212,7 +1497,7 @@ SELECT
   cliente_nome,
   email,
   telefone,
-  GETDATE(),
+  created_at,
   @status,
   @valor_liberado,
   token_usado,
@@ -1261,7 +1546,13 @@ async function deleteDuplicateSameConsultRows(cpf, nome, createdAt, keepId) {
           11
         ),
         LTRIM(RTRIM(ISNULL(cliente_nome, ''))),
-        created_at
+        created_at,
+        LTRIM(RTRIM(ISNULL(status_consulta_v8, ''))),
+        ISNULL(valor_liberado, CAST(-99999999.99 AS DECIMAL(18, 2))),
+        LTRIM(RTRIM(ISNULL(mensagem, ''))),
+        LTRIM(RTRIM(ISNULL(tipoConsulta, ''))),
+        LTRIM(RTRIM(ISNULL(empresa, ''))),
+        ISNULL(id_token_usado, -1)
       ORDER BY
         CASE WHEN id = @keep_id THEN 0 ELSE 1 END,
         updated_at DESC,
@@ -1412,9 +1703,21 @@ async function processClient(client) {
             await sleep(config.worker.waitBetweenApisMs);
           const authResp = await authorizeConsult(accessToken, consultId);
           if (Number(authResp.status || 0) >= 400) {
-            lastApiStatus = normalizeStatusForDb(`HTTP_${authResp.status}`, lastApiStatus || "Pendente");
+            const friendlyAuthError = buildFriendlyV8HttpError(
+              authResp.status,
+              authResp.data
+            );
+            if (friendlyAuthError) {
+              lastApiStatus = normalizeStatusForDb(
+                friendlyAuthError.statusDb,
+                lastApiStatus || "Pendente"
+              );
+              lastErrorMessage = friendlyAuthError.message;
+            } else {
+              lastApiStatus = normalizeStatusForDb(`HTTP_${authResp.status}`, lastApiStatus || "Pendente");
+            }
             const authMessage = extractApiErrorMessage(authResp.data);
-            if (authMessage) {
+            if (!friendlyAuthError && authMessage) {
               lastErrorMessage = authMessage;
             }
             lastResponsePayload = {
@@ -1445,9 +1748,21 @@ async function processClient(client) {
             tipoConsulta: client.tipoConsulta || "",
           });
         } else if (createStatus >= 400) {
-          lastApiStatus = normalizeStatusForDb(`HTTP_${createStatus}`, lastApiStatus || "Pendente");
+          const friendlyCreateError = buildFriendlyV8HttpError(
+            createStatus,
+            createResp.data
+          );
+          if (friendlyCreateError) {
+            lastApiStatus = normalizeStatusForDb(
+              friendlyCreateError.statusDb,
+              lastApiStatus || "Pendente"
+            );
+            lastErrorMessage = friendlyCreateError.message;
+          } else {
+            lastApiStatus = normalizeStatusForDb(`HTTP_${createStatus}`, lastApiStatus || "Pendente");
+          }
           const createMessage = extractApiErrorMessage(createResp.data);
-          if (createMessage) {
+          if (!friendlyCreateError && createMessage) {
             lastErrorMessage = createMessage;
           }
           lastResponsePayload = {
@@ -1464,9 +1779,21 @@ async function processClient(client) {
         lastResponsePayload = resultPayload;
         const resultStatus = Number(resultResp.status || 0);
         if (resultStatus >= 400) {
-          lastApiStatus = normalizeStatusForDb(`HTTP_${resultStatus}`, lastApiStatus || "Pendente");
+          const friendlyResultError = buildFriendlyV8HttpError(
+            resultStatus,
+            resultPayload
+          );
+          if (friendlyResultError) {
+            lastApiStatus = normalizeStatusForDb(
+              friendlyResultError.statusDb,
+              lastApiStatus || "Pendente"
+            );
+            lastErrorMessage = friendlyResultError.message;
+          } else {
+            lastApiStatus = normalizeStatusForDb(`HTTP_${resultStatus}`, lastApiStatus || "Pendente");
+          }
           const resultMessage = extractApiErrorMessage(resultPayload);
-          if (resultMessage) {
+          if (!friendlyResultError && resultMessage) {
             lastErrorMessage = resultMessage;
           }
         }
@@ -1480,6 +1807,15 @@ async function processClient(client) {
           marginValue = parsed.marginValue;
         }
 
+        if (resultStatus < 400 && parsed.totalRows === 0) {
+          success = true;
+          stopAttemptsWithoutRetry = true;
+          lastApiStatus = normalizeStatusForDb("SUCCESS", lastApiStatus || "SUCCESS");
+          lastErrorMessage = "Sem tabelas disponiveis";
+          state.resultOnlyById.delete(client.id);
+          break;
+        }
+
         if (parsed.hasSuccess) {
           success = true;
           stopAttemptsWithoutRetry = true;
@@ -1487,22 +1823,7 @@ async function processClient(client) {
           break;
         }
 
-        if (runOnlyLastApi && parsed.totalRows === 0) {
-          lastApiStatus = normalizeStatusForDb(
-            "WAITING_CONSULT",
-            lastApiStatus || "WAITING_CONSULT"
-          );
-          if (!lastErrorMessage) {
-            lastErrorMessage =
-              "Consulta ativa identificada; aguardando retorno da API final";
-          }
-          if (attempt < config.worker.maxAttempts) {
-            retryThisCycle = true;
-          } else {
-            shouldParkForResultOnly = true;
-            stopAttemptsWithoutRetry = true;
-          }
-        } else if (isResultOnlyRetryStatus(parsed.statusText)) {
+        if (isResultOnlyRetryStatus(parsed.statusText)) {
           runOnlyLastApi = true;
           state.resultOnlyById.set(client.id, {
             status: normalizeStatusToken(parsed.statusText),
@@ -1582,7 +1903,11 @@ async function processClient(client) {
         valorLiberado: primaryMargin,
         mensagem: primaryMessage,
       });
-      const duplicatedCount = await duplicateClientRows(client.id, duplicateRows);
+      const duplicatedCount = await duplicateClientRows(
+        client.id,
+        duplicateRows,
+        primaryRow
+      );
       const removedDuplicates = await deleteDuplicateSameConsultRows(
         client.cliente_cpf,
         client.cliente_nome,
@@ -1613,7 +1938,11 @@ async function processClient(client) {
         valorLiberado: primaryMargin,
         mensagem: primaryMessage,
       });
-      const duplicatedCount = await duplicateClientRows(client.id, duplicateRows);
+      const duplicatedCount = await duplicateClientRows(
+        client.id,
+        duplicateRows,
+        primaryRow
+      );
       const removedDuplicates = await deleteDuplicateSameConsultRows(
         client.cliente_cpf,
         client.cliente_nome,
@@ -1849,7 +2178,14 @@ async function bootstrap() {
   await loadTokens(true);
 
   const app = express();
-  app.use(express.json({ limit: "1mb" }));
+  app.use(express.json({ limit: "10mb" }));
+  app.use((req, res, next) => {
+    applyCors(req, res);
+    if (req.method === "OPTIONS") {
+      return res.status(204).end();
+    }
+    return next();
+  });
 
   app.get("/health", (_req, res) => {
     res.status(200).json({ ok: true, service: "api-consultaV8-queue" });
@@ -1868,12 +2204,138 @@ async function bootstrap() {
     }
   });
 
+  app.post(
+    "/api/clientes-v8/import-csv",
+    express.text({
+      type: ["text/csv", "application/csv", "text/plain"],
+      limit: "20mb",
+    }),
+    async (req, res) => {
+      try {
+        const isTextBody = typeof req.body === "string";
+        const source = isTextBody ? req.query || {} : req.body || {};
+        const csvRaw = isTextBody ? req.body : source.csv;
+
+        const nomeArquivo = String(
+          source.nomeArquivo || source.nome_arquivo || source.tipoConsulta || ""
+        ).trim();
+        const empresa = String(source.empresa || "").trim();
+        const tokenUsado = String(
+          source.token_usado ?? source.token_usaro ?? ""
+        ).trim();
+        const idTokenUsado = Number.parseInt(
+          source.id_token_usado ?? source.idTokenUsado,
+          10
+        );
+        const idUserRaw = source.id_user ?? source.idUser;
+        const idUser =
+          idUserRaw === undefined || idUserRaw === null || String(idUserRaw).trim() === ""
+            ? null
+            : Number.parseInt(idUserRaw, 10);
+
+        if (!csvRaw || !String(csvRaw).trim()) {
+          return res.status(400).json({
+            ok: false,
+            error: "Campo csv vazio. Envie o conteudo CSV separado por ';'.",
+          });
+        }
+
+        if (!nomeArquivo) {
+          return res.status(400).json({
+            ok: false,
+            error: "Campo nomeArquivo obrigatorio.",
+          });
+        }
+
+        if (!empresa) {
+          return res.status(400).json({
+            ok: false,
+            error: "Campo empresa obrigatorio.",
+          });
+        }
+
+        if (!tokenUsado) {
+          return res.status(400).json({
+            ok: false,
+            error: "Campo token_usado obrigatorio.",
+          });
+        }
+
+        if (!Number.isFinite(idTokenUsado) || idTokenUsado <= 0) {
+          return res.status(400).json({
+            ok: false,
+            error: "Campo id_token_usado invalido.",
+          });
+        }
+
+        if (
+          idUserRaw !== undefined &&
+          idUserRaw !== null &&
+          String(idUserRaw).trim() !== "" &&
+          (!Number.isFinite(idUser) || idUser <= 0)
+        ) {
+          return res.status(400).json({
+            ok: false,
+            error: "Campo id_user invalido.",
+          });
+        }
+
+        const parsed = parseCsvRowsForClientesV8(csvRaw);
+        if (parsed.rows.length === 0) {
+          return res.status(400).json({
+            ok: false,
+            error: "Nenhuma linha valida no CSV (cpf e nome obrigatorios).",
+            skipped: parsed.skipped,
+          });
+        }
+
+        const insertedAt = new Date();
+        const inserted = await insertClientesV8FromCsv(parsed.rows, {
+          tipoConsulta: nomeArquivo,
+          empresa,
+          tokenUsado,
+          idTokenUsado,
+          idUser,
+          insertedAt,
+        });
+
+        try {
+          await pollPendingClients();
+        } catch (pollErr) {
+          error("Falha ao atualizar fila apos importacao CSV", {
+            erro: pollErr?.message || String(pollErr),
+          });
+        }
+
+        return res.status(200).json({
+          ok: true,
+          inserted,
+          skipped: parsed.skipped.length,
+          skipped_details: parsed.skipped.slice(0, 200),
+          total_data_rows: parsed.totalDataRows,
+          tipoConsulta: nomeArquivo,
+          empresa,
+          id_token_usado: idTokenUsado,
+          id_user: idUser,
+          included_at: insertedAt.toISOString(),
+        });
+      } catch (err) {
+        return res.status(500).json({
+          ok: false,
+          error: err?.message || String(err),
+        });
+      }
+    }
+  );
+
   server = app.listen(config.server.port, config.server.host, () => {
     info("API fila V8 iniciada", {
       host: config.server.host,
       port: config.server.port,
       poll_interval_ms: config.worker.pollIntervalMs,
       max_attempts: config.worker.maxAttempts,
+      cors_origins: corsAllowedOrigins.join(","),
+      cors_credentials: config.cors.allowCredentials,
     });
   });
 
